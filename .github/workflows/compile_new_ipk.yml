@@ -42,8 +42,22 @@ jobs:
     strategy:
       matrix:
         target:
-          - { name: ipk, sdk_url: "https://mirrors.pku.edu.cn/openwrt/releases/22.03.0/targets/x86/64/openwrt-sdk-22.03.0-x86-64_gcc-11.2.0_musl.Linux-x86_64.tar.xz", sdk_tar: "SDK.tar.xz", sdk_dir: "SDK", artifact_pattern: "luci-app-openclash_*.ipk" }
-          - { name: apk, sdk_url: "snapshot", sdk_tar: "SNAPSDK.tar.zst", sdk_dir: "SNAPSDK", artifact_pattern: "luci-app-openclash-*.apk" }
+          - { 
+              name: ipk, 
+              sdk_url: "https://downloads.openwrt.org/releases/24.10.3/targets/ramips/mt7620/openwrt-sdk-24.10.3-ramips-mt7620_gcc-13.3.0_musl.Linux-x86_64.tar.zst", 
+              sdk_tar: "SDK.tar.zst", 
+              sdk_dir: "SDK", 
+              artifact_pattern: "luci-app-openclash_*.ipk",
+              arch: "mipsel_24kc"  # 添加架构信息
+            }
+          - { 
+              name: apk, 
+              sdk_url: "snapshot", 
+              sdk_tar: "SNAPSDK.tar.zst", 
+              sdk_dir: "SNAPSDK", 
+              artifact_pattern: "luci-app-openclash-*.apk",
+              arch: "x86_64"  # 保持原来的架构
+            }
     steps:
       - name: Checkout OpenClash Source
         uses: actions/checkout@v4
@@ -55,24 +69,36 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update
-          sudo apt-get -y install curl git tar zstd python3 python3-pyelftools python3-setuptools
+          sudo apt-get -y install curl git tar zstd python3 python3-pyelftools python3-setuptools build-essential
 
       - name: Download SDK
         run: |
           mkdir -p tmp
           if [ "${{ matrix.target.name }}" = "ipk" ]; then
+            echo "下载 ramips/mt7620 SDK..."
             curl -SLk --connect-timeout 30 --retry 2 "${{ matrix.target.sdk_url }}" -o "./tmp/${{ matrix.target.sdk_tar }}"
             cd tmp
-            tar xf ${{ matrix.target.sdk_tar }}
-            mv openwrt-sdk-* ${{ matrix.target.sdk_dir }}
+            # 使用 zstd 解压 .zst 文件
+            zstd -d ${{ matrix.target.sdk_tar}} -o sdk.tar
+            tar xf sdk.tar
+            # 查找解压后的目录名
+            SDK_DIR=$(find . -maxdepth 1 -type d -name "openwrt-sdk-*" | head -1)
+            if [ -n "$SDK_DIR" ]; then
+              mv "$SDK_DIR" "${{ matrix.target.sdk_dir }}"
+              echo "SDK 目录: $SDK_DIR -> ${{ matrix.target.sdk_dir }}"
+            else
+              echo "错误: 未找到 SDK 目录"
+              exit 1
+            fi
           else
+            echo "下载 snapshot SDK..."
             BASE_URL="https://downloads.openwrt.org/snapshots/targets/x86/64/"
             SDK_NAME=$(curl -s $BASE_URL | grep -oE 'openwrt-sdk-x86-64[^"]+\.tar\.zst' | head -n 1)
             curl -SLk --connect-timeout 30 --retry 2 "$BASE_URL/$SDK_NAME" -o "./tmp/${{ matrix.target.sdk_tar }}"
             cd tmp
-            zstd -d ${{ matrix.target.sdk_tar }}
-            tar xf SNAPSDK.tar
-            SDK_DIR=$(tar tf SNAPSDK.tar | head -n 1 | cut -d/ -f1)
+            zstd -d ${{ matrix.target.sdk_tar}} -o snapshot.tar
+            tar xf snapshot.tar
+            SDK_DIR=$(tar tf snapshot.tar | head -n 1 | cut -d/ -f1)
             mv "$SDK_DIR" "${{ matrix.target.sdk_dir }}"
           fi
 
@@ -80,6 +106,16 @@ jobs:
         run: |
           mkdir -p tmp/${{ matrix.target.sdk_dir }}/package/luci-app-openclash
           cp -rf ./luci-app-openclash/. tmp/${{ matrix.target.sdk_dir }}/package/luci-app-openclash/
+
+      - name: Setup SDK Environment
+        run: |
+          cd tmp/${{ matrix.target.sdk_dir }}
+          # 更新 feeds
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          # 安装必要的依赖
+          ./scripts/feeds install luci-base
+          ./scripts/feeds install luci-compat
 
       - name: Compile po2lmo
         run: |
@@ -89,6 +125,16 @@ jobs:
       - name: Compile OpenClash
         run: |
           cd tmp/${{ matrix.target.sdk_dir }}
+          # 配置编译环境
+          cat > .config << EOF
+CONFIG_TARGET_ramips=${{ matrix.target.name == 'ipk' && 'y' || 'n' }}
+CONFIG_TARGET_ramips_mt7620=${{ matrix.target.name == 'ipk' && 'y' || 'n' }}
+CONFIG_TARGET_x86=${{ matrix.target.name == 'apk' && 'y' || 'n' }}
+CONFIG_TARGET_x86_64=${{ matrix.target.name == 'apk' && 'y' || 'n' }}
+CONFIG_PACKAGE_luci-app-openclash=m
+CONFIG_PACKAGE_luci-base=m
+CONFIG_PACKAGE_luci-compat=m
+EOF
           make defconfig
           make package/luci-app-openclash/compile V=99
 
@@ -96,7 +142,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: openclash-${{ matrix.target.name }}
-          path: tmp/${{ matrix.target.sdk_dir }}/bin/packages/x86_64/base/${{ matrix.target.artifact_pattern }}
+          # 根据架构选择正确的路径
+          path: tmp/${{ matrix.target.sdk_dir }}/bin/packages/${{ matrix.target.arch }}/base/${{ matrix.target.artifact_pattern }}
 
   Post-Process:
     runs-on: ubuntu-latest
